@@ -112,6 +112,14 @@ class EngineCore:
 
         vllm_config.cache_config.num_gpu_blocks = num_gpu_blocks
         vllm_config.cache_config.num_cpu_blocks = num_cpu_blocks
+        logger.info(
+            "\n\nSet cache_config => num_cpu_blocks, num_gpu_blocks to:"
+            "%s, %s (type: %s, %s)",
+            vllm_config.cache_config.num_cpu_blocks,
+            vllm_config.cache_config.num_gpu_blocks,
+            type(vllm_config.cache_config.num_cpu_blocks).__name__,
+            type(vllm_config.cache_config.num_gpu_blocks).__name__,
+        )
         self.collective_rpc("initialize_cache", args=(num_gpu_blocks, num_cpu_blocks))
 
         self.structured_output_manager = StructuredOutputManager(vllm_config)
@@ -245,6 +253,17 @@ class EngineCore:
         scheduler_kv_cache_config = generate_scheduler_kv_cache_config(kv_cache_configs)
         num_gpu_blocks = scheduler_kv_cache_config.num_blocks
         num_cpu_blocks = 0
+
+        # If using OffloadingConnector, read num_cpu_blocks from
+        # kv_connector_extra_config
+        if (
+            vllm_config.kv_transfer_config is not None
+            and vllm_config.kv_transfer_config.kv_connector == "OffloadingConnector"
+        ):
+            extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
+            num_cpu_blocks_value = extra_config.get("num_cpu_blocks")
+            if num_cpu_blocks_value is not None:
+                num_cpu_blocks = int(num_cpu_blocks_value)
 
         # Initialize kv cache and warmup the execution
         self.model_executor.initialize_from_config(kv_cache_configs)
