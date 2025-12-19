@@ -507,6 +507,8 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         return new_metadata
 
     def use_cascade_attention(self, *args, **kwargs) -> bool:
+        # Provide head_size to the heuristic when available for FA3 tuning.
+        kwargs.setdefault("head_size", self.headdim)
         return use_cascade_attention(*args, **kwargs)
 
 
@@ -902,6 +904,7 @@ def use_cascade_attention(
     use_local_attention: bool,
     num_sms: int,
     dcp_world_size: int,
+    head_size: int | None = None,
 ) -> bool:
     """Decide whether to use cascade attention.
 
@@ -909,6 +912,10 @@ def use_cascade_attention(
     given configuration, and 2) heuristically decides whether using cascade
     attention can improve performance.
     """
+    fa_version = get_flash_attn_version()
+    # Fallback if FA version is unknown; keep previous behavior.
+    if fa_version is None:
+        fa_version = 2
     # Too short common prefix. Probably not worth using cascade attention.
     # We use an arbitrary threshold of 256 tokens. TODO: Tune this threshold.
     # NOTE(woosuk): This is the common case. We should return False as soon as
@@ -927,47 +934,101 @@ def use_cascade_attention(
     if dcp_world_size > 1:
         return False
 
-    # Heuristics to decide whether using cascade attention is beneficial.
-    # 1. When FlashDecoding is not used for normal attention, cascade attention
-    #    is likely to be faster since it saves memory bandwidth.
-    num_queries_per_kv = num_query_heads // num_kv_heads
-    # The criteria for using FlashDecoding can be found in the following link:
-    # https://github.com/vllm-project/flash-attention/blob/96266b1111111f3d11aabefaf3bacbab6a89d03c/csrc/flash_attn/flash_api.cpp#L535
-    use_flash_decoding = (
-        num_queries_per_kv > 1
-        and not use_sliding_window
-        and not use_alibi
-        and np.all(query_lens == 1)
-    )
-    if not use_flash_decoding:
-        # Use cascade attention.
-        return True
+    def _fa2_use_cascade() -> bool:
+        # Heuristics to decide whether using cascade attention is beneficial.
+        # 1. When FlashDecoding is not used for normal attention, cascade
+        #    attention is likely to be faster since it saves memory bandwidth.
+        num_queries_per_kv = num_query_heads // num_kv_heads
+        # The criteria for using FlashDecoding can be found in the following
+        # link:
+        # https://github.com/vllm-project/flash-attention/blob/96266b1111111f3d11aabefaf3bacbab6a89d03c/csrc/flash_attn/flash_api.cpp#L535
+        use_flash_decoding = (
+            num_queries_per_kv > 1
+            and not use_sliding_window
+            and not use_alibi
+            and np.all(query_lens == 1)
+        )
+        if not use_flash_decoding:
+            # Use cascade attention.
+            return True
 
-    # 2. When FlashDecoding is used for normal attention, it is not clear
-    #    whether cascade attention is beneficial, because FlashDecoding can
-    #    launch more CTAs than cascade attention.
-    #    We use a simple performance model to compare the two methods.
-    #    NOTE(woosuk): The performance model is very rough and may not be
-    #    accurate.
-    num_tokens = num_reqs
-    # NOTE(woosuk): These are default tile sizes. flash-attn might use
-    # different tile sizes (e.g., 64 or 256) depending on the configuration.
-    q_tile_size = 128
-    kv_tile_size = 128
-    num_prefix_tiles = cdiv(common_prefix_len, kv_tile_size)
+        # 2. When FlashDecoding is used for normal attention, it is not clear
+        #    whether cascade attention is beneficial, because FlashDecoding can
+        #    launch more CTAs than cascade attention.
+        #    We use a simple performance model to compare the two methods.
+        #    NOTE(woosuk): The performance model is very rough and may not be
+        #    accurate.
+        num_tokens = num_reqs
+        # NOTE(woosuk): These are default tile sizes. flash-attn might use
+        # different tile sizes (e.g., 64 or 256) depending on the configuration.
+        q_tile_size = 128
+        kv_tile_size = 128
+        num_prefix_tiles = cdiv(common_prefix_len, kv_tile_size)
 
-    cascade_ctas = num_query_heads * cdiv(num_tokens, q_tile_size)
-    cascade_waves = cdiv(cascade_ctas, num_sms)
-    cascade_time = cascade_waves * num_prefix_tiles
+        cascade_ctas = num_query_heads * cdiv(num_tokens, q_tile_size)
+        cascade_waves = cdiv(cascade_ctas, num_sms)
+        cascade_time = cascade_waves * num_prefix_tiles
 
-    flash_decoding_ctas = (
-        num_reqs * num_kv_heads * cdiv(num_queries_per_kv, q_tile_size)
-    )
-    flash_decoding_ctas *= num_prefix_tiles
-    flash_decoding_time = cdiv(flash_decoding_ctas, num_sms)
+        flash_decoding_ctas = (
+            num_reqs * num_kv_heads * cdiv(num_queries_per_kv, q_tile_size)
+        )
+        flash_decoding_ctas *= num_prefix_tiles
+        flash_decoding_time = cdiv(flash_decoding_ctas, num_sms)
 
-    # Use cascade attention if it is faster than FlashDecoding.
-    return cascade_time < flash_decoding_time
+        # Use cascade attention if it is faster than FlashDecoding.
+        return cascade_time < flash_decoding_time
+
+    def _fa3_tile_sizes(h: int) -> tuple[int, int]:
+        # Approximate FA3 tile sizes based on hopper tile_size_fwd_sm90
+        # (flash-attention/hopper/tile_size.h). Keeps coarse buckets only.
+        if h <= 64:
+            return 192, 160
+        if h <= 96:
+            return 192, 144
+        if h <= 128:
+            return 128, 176
+        if h <= 192:
+            return 128, 112
+        return 128, 80
+
+    def _fa3_use_cascade() -> bool:
+        # FA3: incorporate pack_gqa and split heuristics (approximate).
+        h = head_size if head_size is not None else 128
+        q_tile_size, kv_tile_size = _fa3_tile_sizes(h)
+        num_queries_per_kv = num_query_heads // num_kv_heads
+
+        # PackGQA approximation (flash-attention/hopper/flash_api.cpp:get_pack_gqa):
+        # when q/kv ratio is large, packing reduces effective kv heads.
+        effective_kv_heads = num_kv_heads
+        if num_queries_per_kv >= 4:
+            effective_kv_heads = max(1, num_kv_heads // 2)
+
+        # Split heuristic approximation (get_num_splits / num_splits_heuristic):
+        # if CTAs << SMs, keep split=1; otherwise allow small split factor.
+        base_ctas = num_query_heads * cdiv(num_reqs, q_tile_size)
+        split_factor = 1
+        if base_ctas < int(0.8 * num_sms):
+            split_factor = 1
+        elif base_ctas < 2 * num_sms:
+            split_factor = 2
+        else:
+            split_factor = 3
+
+        num_prefix_tiles = cdiv(common_prefix_len, kv_tile_size)
+
+        cascade_ctas = num_query_heads * cdiv(num_reqs, q_tile_size)
+        cascade_waves = cdiv(cascade_ctas, num_sms)
+        cascade_time = cascade_waves * num_prefix_tiles
+
+        flash_decoding_ctas = (
+            num_reqs * effective_kv_heads * cdiv(num_queries_per_kv, q_tile_size)
+        )
+        flash_decoding_ctas *= num_prefix_tiles
+        flash_decoding_time = cdiv(flash_decoding_ctas, num_sms * split_factor)
+
+        return cascade_time < flash_decoding_time
+
+    return _fa2_use_cascade() if fa_version == 2 else _fa3_use_cascade()
 
 
 def cascade_attention(
